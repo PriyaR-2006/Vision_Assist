@@ -6,6 +6,8 @@ import threading
 import queue
 import pyttsx3
 import gc
+import time
+from pathlib import Path
 from PIL import Image
 from ultralytics import YOLOWorld
 from transformers import pipeline
@@ -19,7 +21,7 @@ CONFIDENCE = 0.15
 VOICE_COOLDOWN = 4.0
 PROCESS_EVERY_N_FRAMES = 3  # Only run models every 3rd frame to save GPU/Heat
 
-YOLO_MODEL = "yolov8s-worldv2.pt"
+YOLO_MODEL = Path(__file__).resolve().parent / "yolov8s-worldv2.pt"
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
 
 CLASSES = [
@@ -56,6 +58,7 @@ PRIORITY = {
 speech_queue = queue.Queue(maxsize=1)
 last_action = None
 last_speech_time = 0.0
+voice_shutdown = False
 voice_lock = threading.Lock()
 
 def voice_worker():
@@ -67,7 +70,7 @@ def voice_worker():
         while True:
             phrase = speech_queue.get()
             try:
-                if phrase is None:
+                if phrase == "__STOP_VOICE_WORKER__":
                     return
                 engine.say(phrase)
                 engine.runAndWait()
@@ -86,6 +89,8 @@ def speak_navigation(action):
     now = time.monotonic()
     
     with voice_lock:
+        if voice_shutdown:
+            return
         # 1. If it's the exact same action, respect the 4-second cooldown
         if action == last_action and (now - last_speech_time) < VOICE_COOLDOWN:
             return
@@ -102,21 +107,27 @@ def speak_navigation(action):
         phrase = PHRASES.get(action)
         if phrase is None:
             return
-            
         last_action = action
         last_speech_time = now
-
-    try:
-        while True:
-            speech_queue.get_nowait()
-            speech_queue.task_done()
-    except queue.Empty:
-        pass
-        
-    try:
+        try:
+            while True:
+                speech_queue.get_nowait()
+                speech_queue.task_done()
+        except queue.Empty:
+            pass
         speech_queue.put_nowait(phrase)
-    except queue.Full:
-        pass
+
+def stop_voice_worker():
+    global voice_shutdown
+    with voice_lock:
+        voice_shutdown = True
+        try:
+            while True:
+                speech_queue.get_nowait()
+                speech_queue.task_done()
+        except queue.Empty:
+            pass
+        speech_queue.put_nowait("__STOP_VOICE_WORKER__")
 
 # ---------------- NAVIGATION HELPERS ----------------
 
@@ -229,7 +240,7 @@ def main():
         print("Using CPU. Processing may be slow.")
 
     print("Loading YOLO-World...")
-    detector = YOLOWorld(YOLO_MODEL)
+    detector = YOLOWorld(str(YOLO_MODEL))
     detector.set_classes(CLASSES)
 
     print("Loading Depth Anything V2...")
@@ -241,7 +252,7 @@ def main():
 
     print("Models loaded.")
 
-    cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         cap.release()
         raise RuntimeError("Cannot open webcam. Check camera permissions or try CAMERA_INDEX = 1.")
@@ -368,10 +379,7 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        try:
-            speech_queue.put_nowait(None)
-        except queue.Full:
-            pass
+        stop_voice_worker()
         print("Program stopped.")
 
 if __name__ == "__main__":
