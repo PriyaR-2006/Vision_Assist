@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch and Machine Learning weights
+*.pt
+*.pth
+*.pkl
+*.bin
+*.safetensors
+yolov8s-worldv2/
+
+# Environments
+.venv/
+venv/
+env/
+
+# IDE configurations
+.vscode/
+.idea/
+
+# Operating system files
+Thumbs.db
+.DS_Store
