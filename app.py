@@ -12,9 +12,8 @@ from PIL import Image
 from ultralytics import YOLOWorld
 from transformers import pipeline
 
-# ---------------- CONFIGURATION ----------------
+# ---------------- CONFIGURATION & GLOBALS ----------------
 
-CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 CONFIDENCE = 0.15
@@ -53,6 +52,10 @@ PRIORITY = {
     "STOP": 5
 }
 
+# Dynamic UI States
+AUDIO_MUTED = False
+STOP_THRESH = 1.0
+
 # ---------------- VOICE GUIDANCE ----------------
 
 speech_queue = queue.Queue(maxsize=1)
@@ -72,8 +75,9 @@ def voice_worker():
             try:
                 if phrase == "__STOP_VOICE_WORKER__":
                     return
-                engine.say(phrase)
-                engine.runAndWait()
+                if not AUDIO_MUTED:
+                    engine.say(phrase)
+                    engine.runAndWait()
             except Exception as exc:
                 print("Voice error:", exc)
             finally:
@@ -89,7 +93,7 @@ def speak_navigation(action):
     now = time.monotonic()
     
     with voice_lock:
-        if voice_shutdown:
+        if voice_shutdown or AUDIO_MUTED:
             return
         if action == last_action and (now - last_speech_time) < VOICE_COOLDOWN:
             return
@@ -101,8 +105,7 @@ def speak_navigation(action):
             return
 
         phrase = PHRASES.get(action)
-        if phrase is None:
-            return
+        if phrase is None: return
         last_action = action
         last_speech_time = now
         try:
@@ -128,17 +131,9 @@ def stop_voice_worker():
 # ---------------- NAVIGATION HELPERS ----------------
 
 def get_position(center_x, width):
-    if center_x < width / 3:
-        return "LEFT"
-    elif center_x < 2 * width / 3:
-        return "CENTER"
+    if center_x < width / 3: return "LEFT"
+    elif center_x < 2 * width / 3: return "CENTER"
     return "RIGHT"
-
-def distance_level(distance):
-    if distance < 0.8: return "VERY NEAR"
-    elif distance < 1.5: return "NEAR"
-    elif distance < 3.0: return "MEDIUM"
-    return "FAR"
 
 def get_object_depth(depth_map, x1, y1, x2, y2):
     height, width = depth_map.shape[:2]
@@ -153,44 +148,39 @@ def get_object_depth(depth_map, x1, y1, x2, y2):
 
     roi = depth_map[cy1:cy2, cx1:cx2]
     if roi.size == 0: return None
-
     valid = roi[np.isfinite(roi) & (roi > 0)]
     if valid.size == 0: return None
-
     return float(np.percentile(valid, 10))
 
 def navigation_decision(name, distance, position):
-    if distance < 1.0 and position == "CENTER": return "STOP"
-    if name in {"room door", "window"}:
-        if distance < 1.0: return "STOP"
-        if distance < 2.0: return "CAUTION"
+    caution_thresh = STOP_THRESH + 1.0
+
+    if distance < STOP_THRESH and position == "CENTER": return "STOP"
+    
+    if name in {"room door", "window", "stairs"}:
+        if distance < STOP_THRESH + 0.2: return "STOP"
+        if distance < caution_thresh: return "CAUTION"
         return "CONTINUE"
-    if name == "stairs":
-        if distance < 1.5: return "STOP"
-        if distance < 2.5: return "CAUTION"
-        return "CONTINUE"
+        
     if name not in OBSTACLES: return "CONTINUE"
 
-    if distance < 1.3:
+    if distance < STOP_THRESH + 0.3:
         if position == "CENTER": return "STOP"
         elif position == "LEFT": return "MOVE RIGHT"
         return "MOVE LEFT"
-    if distance < 2.2:
+        
+    if distance < caution_thresh:
         if position == "CENTER": return "CAUTION"
         elif position == "LEFT": return "KEEP RIGHT"
         return "KEEP LEFT"
-    if distance < 3.5 and position == "CENTER": return "CAUTION"
 
     return "CONTINUE"
 
 def get_depth_array(result):
     predicted = result.get("predicted_depth")
-    if predicted is None: raise RuntimeError("Depth model did not return predicted_depth.")
     if isinstance(predicted, torch.Tensor):
-        depth = predicted.detach().float().squeeze().cpu().numpy()
-    else:
-        depth = np.asarray(predicted, dtype=np.float32).squeeze()
-    return depth
+        return predicted.detach().float().squeeze().cpu().numpy()
+    return np.asarray(predicted, dtype=np.float32).squeeze()
 
 # ---------------- UI APPLICATION ----------------
 
@@ -200,122 +190,128 @@ ctk.set_default_color_theme("blue")
 class VisionAssistApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Vision Assist - Indoor Navigation")
-        self.geometry("1000x700")
+        self.title("Vision Assist - Professional Dashboard")
+        self.geometry("1100x650")
         
-        # Main Layout
+        # Grid Layout (Video on left, Sidebar on right)
         self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=0)
         self.grid_rowconfigure(0, weight=1)
         
+        # --- LEFT: VIDEO FRAME ---
         self.video_frame = ctk.CTkFrame(self)
-        self.video_frame.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
-        
+        self.video_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
         self.video_label = ctk.CTkLabel(self.video_frame, text="Initializing AI Models...\nPlease wait.", font=("Arial", 24))
         self.video_label.pack(expand=True)
         
-        self.control_frame = ctk.CTkFrame(self, height=100)
-        self.control_frame.grid(row=1, column=0, padx=20, pady=(0, 20), sticky="ew")
+        # --- RIGHT: SIDEBAR (CONTROLS & HUD) ---
+        self.sidebar_frame = ctk.CTkFrame(self, width=280)
+        self.sidebar_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
         
-        self.start_btn = ctk.CTkButton(self.control_frame, text="Start Camera", font=("Arial", 16), height=40, state="disabled", command=self.start_camera)
-        self.start_btn.pack(side="left", padx=20, pady=20, expand=True)
+        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Vision Assist UI", font=ctk.CTkFont(size=22, weight="bold"))
+        self.logo_label.pack(pady=(20, 30))
         
-        self.stop_btn = ctk.CTkButton(self.control_frame, text="Stop Camera", font=("Arial", 16), height=40, fg_color="#C62828", hover_color="#b71c1c", state="disabled", command=self.stop_camera)
-        self.stop_btn.pack(side="right", padx=20, pady=20, expand=True)
+        # 1. Camera Dropdown
+        self.cam_label = ctk.CTkLabel(self.sidebar_frame, text="Select Camera Input:")
+        self.cam_label.pack(anchor="w", padx=20)
+        self.camera_option = ctk.CTkOptionMenu(self.sidebar_frame, values=["Camera 0", "Camera 1", "Camera 2"])
+        self.camera_option.pack(padx=20, pady=(0, 20), fill="x")
+        
+        # 2. Audio Mute Toggle
+        self.mute_switch = ctk.CTkSwitch(self.sidebar_frame, text="Mute Voice Guidance", command=self.toggle_mute)
+        self.mute_switch.pack(padx=20, pady=10, anchor="w")
+        
+        # 3. Dynamic Distance Slider
+        self.slider_label = ctk.CTkLabel(self.sidebar_frame, text=f"STOP Threshold: {STOP_THRESH:.1f}m")
+        self.slider_label.pack(anchor="w", padx=20, pady=(20, 5))
+        self.dist_slider = ctk.CTkSlider(self.sidebar_frame, from_=0.5, to=2.5, command=self.update_threshold)
+        self.dist_slider.set(STOP_THRESH)
+        self.dist_slider.pack(padx=20, pady=(0, 30), fill="x")
+        
+        # Start/Stop Buttons
+        self.start_btn = ctk.CTkButton(self.sidebar_frame, text="Start Camera", height=40, state="disabled", command=self.start_camera)
+        self.start_btn.pack(padx=20, pady=10, fill="x")
+        
+        self.stop_btn = ctk.CTkButton(self.sidebar_frame, text="Stop Camera", height=40, fg_color="#C62828", hover_color="#b71c1c", state="disabled", command=self.stop_camera)
+        self.stop_btn.pack(padx=20, pady=10, fill="x")
 
+        # 4. Performance HUD
+        self.hud_frame = ctk.CTkFrame(self.sidebar_frame, fg_color="transparent")
+        self.hud_frame.pack(side="bottom", pady=20, fill="x")
+        self.hud_label = ctk.CTkLabel(self.hud_frame, text="FPS: 0.0\nAI Latency: 0 ms", font=ctk.CTkFont(size=14), justify="left")
+        self.hud_label.pack()
+
+        # Threading/App State
         self.cap = None
         self.is_running = False
         self.models_ready = False
         self._camera_thread = None
         self._camera_stop_event = None
-        self._model_thread = None
         self._closing = False
         self.device = 0 if torch.cuda.is_available() else -1
         
-        # Thread-safe queue for sending processed frames to the UI
         self.frame_queue = queue.Queue(maxsize=2)
         self.ui_event_queue = queue.Queue()
-
-        # Start TTS Worker
-        self._voice_thread = threading.Thread(target=voice_worker, daemon=True)
-        self._voice_thread.start()
         
-        # Load Models in Background
-        self._model_thread = threading.Thread(target=self.load_models, daemon=True)
-        self._model_thread.start()
+        # Live Stats variables
+        self.current_fps = 0.0
+        self.current_ai_time = 0.0
+
+        # Boot Backend
+        threading.Thread(target=voice_worker, daemon=True).start()
+        threading.Thread(target=self.load_models, daemon=True).start()
         self.after(50, self._process_ui_events)
+
+    def toggle_mute(self):
+        global AUDIO_MUTED
+        AUDIO_MUTED = self.mute_switch.get() == 1
+
+    def update_threshold(self, value):
+        global STOP_THRESH
+        STOP_THRESH = float(value)
+        self.slider_label.configure(text=f"STOP Threshold: {STOP_THRESH:.1f}m")
 
     def load_models(self):
         try:
             self.detector = YOLOWorld(str(YOLO_MODEL))
             self.detector.set_classes(CLASSES)
-            
-            # Apply FP16 to YOLO once during startup to stop terminal spam
             if self.device == 0:
                 self.detector.model.half()
             
-            # Changed 'torch_dtype' to 'dtype' to satisfy the new transformers API
             dtype = torch.float16 if self.device == 0 else torch.float32
-            self.depth_estimator = pipeline(
-                "depth-estimation", 
-                model=DEPTH_MODEL, 
-                device=self.device,
-                dtype=dtype
-            )
+            self.depth_estimator = pipeline("depth-estimation", model=DEPTH_MODEL, device=self.device, dtype=dtype)
         except Exception as exc:
-            print(f"Model loading error: {exc}")
             self.ui_event_queue.put(("model_load_error", str(exc)))
             return
-
         self.ui_event_queue.put(("models_loaded", None))
 
-    def _models_loaded(self):
-        self.models_ready = True
-        self.video_label.configure(text="Models Loaded Successfully.\nReady to start.")
-        self.start_btn.configure(state="normal")
-
-    def _show_model_load_error(self, error):
-        self.video_label.configure(text=f"Could not load AI models:\n{error}")
-        self.start_btn.configure(state="disabled")
-
     def _process_ui_events(self):
-        if self._closing:
-            return
+        if self._closing: return
         try:
             while True:
                 event, payload = self.ui_event_queue.get_nowait()
                 if event == "models_loaded":
-                    self._models_loaded()
-                elif event == "model_load_error":
-                    self._show_model_load_error(payload)
-                elif event == "camera_error":
-                    stop_event, error = payload
-                    if self._camera_stop_event is stop_event and self.is_running:
-                        self.stop_camera()
-                        self.video_label.configure(text=f"Camera error:\n{error}")
+                    self.models_ready = True
+                    self.video_label.configure(text="Models Loaded Successfully.\nReady to start.")
+                    self.start_btn.configure(state="normal")
                 elif event == "camera_finished":
-                    stop_event = payload
-                    if self._camera_stop_event is stop_event and self.is_running:
+                    if self._camera_stop_event is payload and self.is_running:
                         self.stop_camera()
-                        self.video_label.configure(text="Camera stopped unexpectedly.")
         except queue.Empty:
             pass
         self.after(50, self._process_ui_events)
 
     def start_camera(self):
-        if self._closing or not self.models_ready or self.is_running:
-            return
-        if self._camera_thread is not None and self._camera_thread.is_alive():
-            return
-        while True:
-            try:
-                self.frame_queue.get_nowait()
-            except queue.Empty:
-                break
+        if self._closing or not self.models_ready or self.is_running: return
+        
+        cam_idx = int(self.camera_option.get().split(" ")[1])
+        
+        while not self.frame_queue.empty():
+            self.frame_queue.get_nowait()
 
-        cap = cv2.VideoCapture(CAMERA_INDEX)
+        cap = cv2.VideoCapture(cam_idx)
         if not cap.isOpened():
-            cap.release()
-            self.video_label.configure(text="Could not open camera. Check camera connection and permissions.")
+            self.video_label.configure(text="Could not open selected camera.")
             return
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
@@ -328,49 +324,23 @@ class VisionAssistApp(ctk.CTk):
         self.stop_btn.configure(state="normal")
         self.video_label.configure(text="")
 
-        self._camera_thread = threading.Thread(
-            target=self.ai_inference_loop,
-            args=(cap, self._camera_stop_event),
-            daemon=True,
-        )
+        self._camera_thread = threading.Thread(target=self._run_ai_inference_loop, args=(cap, self._camera_stop_event), daemon=True)
         self._camera_thread.start()
         self.update_ui_frame()
 
     def stop_camera(self):
         self.is_running = False
-        if self._camera_stop_event is not None:
-            self._camera_stop_event.set()
+        if self._camera_stop_event: self._camera_stop_event.set()
         if self.cap:
             self.cap.release()
             self.cap = None
         self.video_label.configure(image="")
         self.video_label.configure(text="Camera Stopped.")
         self.stop_btn.configure(state="disabled")
-        if not self._closing:
-            self._enable_start_when_camera_stops()
-        
-        try:
-            speech_queue.put_nowait("System stopped.")
-        except queue.Full:
-            pass
-
-    def _enable_start_when_camera_stops(self):
-        if self._camera_thread is not None and self._camera_thread.is_alive():
-            self.after(50, self._enable_start_when_camera_stops)
-            return
-        self._camera_thread = None
-        self._camera_stop_event = None
-        if self.models_ready and not self._closing:
+        if not self._closing and self.models_ready:
             self.start_btn.configure(state="normal")
-
-    def ai_inference_loop(self, cap, stop_event):
-        try:
-            self._run_ai_inference_loop(cap, stop_event)
-        except Exception as exc:
-            print(f"Camera processing error: {exc}")
-            self.ui_event_queue.put(("camera_error", (stop_event, str(exc))))
-        finally:
-            self.ui_event_queue.put(("camera_finished", stop_event))
+        try: speech_queue.put_nowait("System stopped.")
+        except queue.Full: pass
 
     def _run_ai_inference_loop(self, cap, stop_event):
         frame_count = 0
@@ -378,30 +348,25 @@ class VisionAssistApp(ctk.CTk):
         current_action = "CONTINUE"
         current_warning = ""
         
+        time_prev = time.monotonic()
+
         with torch.inference_mode():
             while not stop_event.is_set() and cap.isOpened():
                 success, frame = cap.read()
-                if not success:
-                    break
+                if not success: break
 
                 frame_count += 1
                 frame_h, frame_w = frame.shape[:2]
 
-               # Heavy AI processing
-                if frame_count % PROCESS_EVERY_N_FRAMES == 0:
-                    
-                    # Removed deprecated 'half=True' (now handled during model load)
-                    results = self.detector.predict(
-                        source=frame, 
-                        conf=CONFIDENCE, 
-                        device=self.device, 
-                        imgsz=320, 
-                        verbose=False
-                    )
-                    result = results[0]
+                time_now = time.monotonic()
+                self.current_fps = 1.0 / max(time_now - time_prev, 1e-6)
+                time_prev = time_now
 
-                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    rgb_small = cv2.resize(rgb, (320, 240))
+                if frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                    ai_start_time = time.monotonic()
+                    
+                    results = self.detector.predict(source=frame, conf=CONFIDENCE, device=self.device, imgsz=320, verbose=False)
+                    rgb_small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (320, 240))
                     depth_result = self.depth_estimator(Image.fromarray(rgb_small))
                     depth_map = cv2.resize(get_depth_array(depth_result), (frame_w, frame_h), interpolation=cv2.INTER_LINEAR)
 
@@ -409,97 +374,77 @@ class VisionAssistApp(ctk.CTk):
                     current_warning = ""
                     detections_to_draw.clear()
 
-                    if result.boxes is not None:
-                        for box in result.boxes:
+                    if results[0].boxes is not None:
+                        for box in results[0].boxes:
                             x1, y1, x2, y2 = box.xyxy[0].detach().cpu().numpy().astype(int)
-                            confidence = float(box.conf[0].detach().cpu())
                             class_id = int(box.cls[0].detach().cpu())
-                            
-                            names = result.names
-                            class_name = names.get(class_id, str(class_id)) if isinstance(names, dict) else names[class_id]
+                            class_name = results[0].names[class_id]
 
-                            center_x = (x1 + x2) // 2
-                            position = get_position(center_x, frame_w)
+                            position = get_position((x1 + x2) // 2, frame_w)
                             distance = get_object_depth(depth_map, x1, y1, x2, y2)
 
                             if distance is None: continue
 
-                            level = distance_level(distance)
                             action = navigation_decision(class_name, distance, position)
-
                             if PRIORITY.get(action, 0) > PRIORITY.get(current_action, 0):
                                 current_action = action
                                 current_warning = f"{action}: {class_name} {distance:.2f}m {position}"
 
                             detections_to_draw.append((x1, y1, x2, y2, class_name, distance, action, position))
 
-                    # Pure-Depth Safety Net
                     center_crop = depth_map[int(frame_h*0.3):int(frame_h*0.7), int(frame_w*0.3):int(frame_w*0.7)]
                     valid_center = center_crop[np.isfinite(center_crop) & (center_crop > 0)]
                     if valid_center.size > 0:
                         center_dist = float(np.percentile(valid_center, 5))
-                        if center_dist < 1.0 and PRIORITY["STOP"] > PRIORITY.get(current_action, 0):
+                        if center_dist < STOP_THRESH and PRIORITY["STOP"] > PRIORITY.get(current_action, 0):
                             current_action = "STOP"
                             current_warning = f"STOP: Proximity Alert {center_dist:.2f}m CENTER"
+                            
+                    self.current_ai_time = (time.monotonic() - ai_start_time) * 1000
 
                     if frame_count % 30 == 0:
                         torch.cuda.empty_cache()
                         gc.collect()
 
-                # Drawing visuals (happens every frame, but based on cached AI data)
+                # --- VISUAL RENDERING ---
                 for det in detections_to_draw:
-                    x1, y1, x2, y2, class_name, distance, action, position = det
+                    x1, y1, x2, y2, class_name, distance, _, _ = det
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(frame, f"{class_name} {distance:.2f}m", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
+                
                 color = (255, 0, 0) if current_action == "STOP" else (0, 255, 255) if "MOVE" in current_action or "KEEP" in current_action else (0, 255, 0)
                 
-                speak_navigation(current_action)
-
+                # Top Black Banner
                 cv2.rectangle(frame, (0, 0), (frame_w, 40), (0, 0, 0), -1)
                 cv2.putText(frame, f"NAV: {current_action}", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                 
+                # Warning Text Below Banner
                 if current_warning:
                     cv2.putText(frame, current_warning, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                # Convert to UI format and send to the UI thread
-                cv2_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_image = Image.fromarray(cv2_image)
-                try:
-                    self.frame_queue.put_nowait(pil_image)
-                except queue.Full:
-                    try:
-                        self.frame_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        self.frame_queue.put_nowait(pil_image)
-                    except queue.Full:
-                        pass
+                speak_navigation(current_action)
+
+                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                try: self.frame_queue.put_nowait(pil_image)
+                except queue.Full: pass
+
+        self.ui_event_queue.put(("camera_finished", stop_event))
 
     def update_ui_frame(self):
-        if not self.is_running or self._closing:
-            return
-
+        if not self.is_running or self._closing: return
         try:
-            # Pull the latest ready image from the background thread
             pil_image = self.frame_queue.get_nowait()
             ctk_image = ctk.CTkImage(light_image=pil_image, size=(FRAME_WIDTH, FRAME_HEIGHT))
             self.video_label.configure(image=ctk_image)
-            # Important: Keep a reference to prevent garbage collection flickering
             self.video_label.image = ctk_image
-        except queue.Empty:
-            pass
+        except queue.Empty: pass
 
-        # Schedule next UI update very fast (15ms), as it no longer blocks AI
+        self.hud_label.configure(text=f"FPS: {self.current_fps:.1f}\nAI Latency: {self.current_ai_time:.0f} ms")
         self.after(15, self.update_ui_frame)
 
     def on_closing(self):
-        if self._closing:
-            return
+        if self._closing: return
         self._closing = True
-        self.start_btn.configure(state="disabled")
-        self.stop_btn.configure(state="disabled")
         self.stop_camera()
         stop_voice_worker()
         self.destroy()
