@@ -249,13 +249,17 @@ class VisionAssistApp(ctk.CTk):
             self.detector = YOLOWorld(str(YOLO_MODEL))
             self.detector.set_classes(CLASSES)
             
-            # OPTIMIZATION 1: Use FP16 (16-bit math) on GPU to double speed and halve VRAM
+            # Apply FP16 to YOLO once during startup to stop terminal spam
+            if self.device == 0:
+                self.detector.model.half()
+            
+            # Changed 'torch_dtype' to 'dtype' to satisfy the new transformers API
             dtype = torch.float16 if self.device == 0 else torch.float32
             self.depth_estimator = pipeline(
                 "depth-estimation", 
                 model=DEPTH_MODEL, 
                 device=self.device,
-                torch_dtype=dtype
+                dtype=dtype
             )
         except Exception as exc:
             print(f"Model loading error: {exc}")
@@ -383,13 +387,14 @@ class VisionAssistApp(ctk.CTk):
                 frame_count += 1
                 frame_h, frame_w = frame.shape[:2]
 
-                # Heavy AI processing
+               # Heavy AI processing
                 if frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                    
+                    # Removed deprecated 'half=True' (now handled during model load)
                     results = self.detector.predict(
                         source=frame, 
                         conf=CONFIDENCE, 
                         device=self.device, 
-                        half=True if self.device == 0 else False,
                         imgsz=320, 
                         verbose=False
                     )
