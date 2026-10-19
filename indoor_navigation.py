@@ -15,7 +15,7 @@ from transformers import pipeline
 CAMERA_INDEX = 0
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
-CONFIDENCE = 0.25
+CONFIDENCE = 0.15
 VOICE_COOLDOWN = 4.0
 PROCESS_EVERY_N_FRAMES = 3  # Only run models every 3rd frame to save GPU/Heat
 
@@ -135,10 +135,11 @@ def get_object_depth(depth_map, x1, y1, x2, y2):
     box_w = x2 - x1
     box_h = y2 - y1
 
-    cx1 = int(x1 + 0.20 * box_w)
-    cx2 = int(x2 - 0.20 * box_w)
-    cy1 = int(y1 + 0.20 * box_h)
-    cy2 = int(y2 - 0.20 * box_h)
+    # Tighter crop: Use only the central 40% of the bounding box to avoid background bleed
+    cx1 = int(x1 + 0.30 * box_w)
+    cx2 = int(x2 - 0.30 * box_w)
+    cy1 = int(y1 + 0.30 * box_h)
+    cy2 = int(y2 - 0.30 * box_h)
 
     roi = depth_map[cy1:cy2, cx1:cx2]
 
@@ -150,34 +151,46 @@ def get_object_depth(depth_map, x1, y1, x2, y2):
     if valid.size == 0:
         return None
 
-    return float(np.median(valid))
+    # CRITICAL FIX: Get the 10th percentile (the closest parts of the object) instead of the median
+    return float(np.percentile(valid, 10))
+
+
 
 def navigation_decision(name, distance, position):
     if name in {"room door", "window"}:
-        return "CAUTION" if distance < 1.0 else "CONTINUE"
+        return "CAUTION" if distance < 1.5 else "CONTINUE"
+
     if name == "stairs":
-        if distance < 1.0:
+        if distance < 1.5:
             return "STOP"
-        elif distance < 2.0:
+        elif distance < 2.5:
             return "CAUTION"
         return "CONTINUE"
+
     if name not in OBSTACLES:
         return "CONTINUE"
-    if distance < 0.8:
+
+    # Increased STOP threshold from 0.8m to 1.3m (~4.2 feet)
+    if distance < 1.3:
         if position == "CENTER":
             return "STOP"
         elif position == "LEFT":
             return "MOVE RIGHT"
         return "MOVE LEFT"
-    if distance < 1.5:
+
+    # Increased CAUTION threshold from 1.5m to 2.2m (~7.2 feet)
+    if distance < 2.2:
         if position == "CENTER":
             return "CAUTION"
         elif position == "LEFT":
             return "KEEP RIGHT"
         return "KEEP LEFT"
-    if distance < 3.0 and position == "CENTER":
+
+    if distance < 3.5 and position == "CENTER":
         return "CAUTION"
+
     return "CONTINUE"
+
 
 # ---------------- DEPTH CONVERSION ----------------
 
