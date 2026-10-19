@@ -214,18 +214,15 @@ class VisionAssistApp(ctk.CTk):
 
         self.cap = None
         self.is_running = False
-        self.frame_count = 0
         self.device = 0 if torch.cuda.is_available() else -1
         
-        self.detections_to_draw = []
-        self.current_action = "CONTINUE"
-        self.current_warning = ""
-        self.previous_time = time.monotonic()
+        # Thread-safe queue for sending processed frames to the UI
+        self.frame_queue = queue.Queue(maxsize=2)
 
         # Start TTS Worker
         threading.Thread(target=voice_worker, daemon=True).start()
         
-        # Load Models in Background to prevent UI freeze
+        # Load Models in Background
         threading.Thread(target=self.load_models, daemon=True).start()
 
     def load_models(self):
@@ -246,7 +243,12 @@ class VisionAssistApp(ctk.CTk):
             self.start_btn.configure(state="disabled")
             self.stop_btn.configure(state="normal")
             self.video_label.configure(text="")
-            self.update_frame()
+            
+            # Start the heavy processing in a background thread
+            threading.Thread(target=self.ai_inference_loop, daemon=True).start()
+            
+            # Start the lightweight UI updater
+            self.update_ui_frame()
 
     def stop_camera(self):
         self.is_running = False
@@ -262,18 +264,23 @@ class VisionAssistApp(ctk.CTk):
         except queue.Full:
             pass
 
-    def update_frame(self):
-        if not self.is_running or not self.cap.isOpened():
-            return
+    def ai_inference_loop(self):
+        frame_count = 0
+        detections_to_draw = []
+        current_action = "CONTINUE"
+        current_warning = ""
+        
+        with torch.inference_mode():
+            while self.is_running and self.cap.isOpened():
+                success, frame = self.cap.read()
+                if not success:
+                    continue
 
-        success, frame = self.cap.read()
-        if success:
-            self.frame_count += 1
-            frame_h, frame_w = frame.shape[:2]
+                frame_count += 1
+                frame_h, frame_w = frame.shape[:2]
 
-            with torch.inference_mode():
-                # Inference cycle
-                if self.frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                # Heavy AI processing
+                if frame_count % PROCESS_EVERY_N_FRAMES == 0:
                     results = self.detector.predict(source=frame, conf=CONFIDENCE, device=self.device, verbose=False)
                     result = results[0]
 
@@ -282,9 +289,9 @@ class VisionAssistApp(ctk.CTk):
                     depth_result = self.depth_estimator(Image.fromarray(rgb_small))
                     depth_map = cv2.resize(get_depth_array(depth_result), (frame_w, frame_h), interpolation=cv2.INTER_LINEAR)
 
-                    self.current_action = "CONTINUE"
-                    self.current_warning = ""
-                    self.detections_to_draw.clear()
+                    current_action = "CONTINUE"
+                    current_warning = ""
+                    detections_to_draw.clear()
 
                     if result.boxes is not None:
                         for box in result.boxes:
@@ -304,50 +311,69 @@ class VisionAssistApp(ctk.CTk):
                             level = distance_level(distance)
                             action = navigation_decision(class_name, distance, position)
 
-                            if PRIORITY.get(action, 0) > PRIORITY.get(self.current_action, 0):
-                                self.current_action = action
-                                self.current_warning = f"{action}: {class_name} {distance:.2f}m {position}"
+                            if PRIORITY.get(action, 0) > PRIORITY.get(current_action, 0):
+                                current_action = action
+                                current_warning = f"{action}: {class_name} {distance:.2f}m {position}"
 
-                            self.detections_to_draw.append((x1, y1, x2, y2, class_name, distance, action, position))
+                            detections_to_draw.append((x1, y1, x2, y2, class_name, distance, action, position))
 
                     # Pure-Depth Safety Net
                     center_crop = depth_map[int(frame_h*0.3):int(frame_h*0.7), int(frame_w*0.3):int(frame_w*0.7)]
                     valid_center = center_crop[np.isfinite(center_crop) & (center_crop > 0)]
                     if valid_center.size > 0:
                         center_dist = float(np.percentile(valid_center, 5))
-                        if center_dist < 1.0 and PRIORITY["STOP"] > PRIORITY.get(self.current_action, 0):
-                            self.current_action = "STOP"
-                            self.current_warning = f"STOP: Proximity Alert {center_dist:.2f}m CENTER"
+                        if center_dist < 1.0 and PRIORITY["STOP"] > PRIORITY.get(current_action, 0):
+                            current_action = "STOP"
+                            current_warning = f"STOP: Proximity Alert {center_dist:.2f}m CENTER"
 
-                    if self.frame_count % 30 == 0:
+                    if frame_count % 30 == 0:
                         torch.cuda.empty_cache()
                         gc.collect()
 
-            # Render persistent data
-            for det in self.detections_to_draw:
-                x1, y1, x2, y2, class_name, distance, action, position = det
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, f"{class_name} {distance:.2f}m", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # Drawing visuals (happens every frame, but based on cached AI data)
+                for det in detections_to_draw:
+                    x1, y1, x2, y2, class_name, distance, action, position = det
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"{class_name} {distance:.2f}m", (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            color = (255, 0, 0) if self.current_action == "STOP" else (0, 255, 255) if "MOVE" in self.current_action or "KEEP" in self.current_action else (0, 255, 0)
-            
-            speak_navigation(self.current_action)
+                color = (255, 0, 0) if current_action == "STOP" else (0, 255, 255) if "MOVE" in current_action or "KEEP" in current_action else (0, 255, 0)
+                
+                speak_navigation(current_action)
 
-            cv2.rectangle(frame, (0, 0), (frame_w, 40), (0, 0, 0), -1)
-            cv2.putText(frame, f"NAV: {self.current_action}", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            
-            if self.current_warning:
-                cv2.putText(frame, self.current_warning, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.rectangle(frame, (0, 0), (frame_w, 40), (0, 0, 0), -1)
+                cv2.putText(frame, f"NAV: {current_action}", (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                if current_warning:
+                    cv2.putText(frame, current_warning, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            # Convert to UI Image
-            cv2_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(cv2_image)
-            ctk_image = ctk.CTkImage(light_image=pil_image, size=(FRAME_WIDTH, FRAME_HEIGHT))
-            
+                # Convert to UI format and send to the UI thread
+                cv2_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_image = Image.fromarray(cv2_image)
+                ctk_image = ctk.CTkImage(light_image=pil_image, size=(FRAME_WIDTH, FRAME_HEIGHT))
+                
+                try:
+                    # Overwrite old frame if UI is slightly behind
+                    if self.frame_queue.full():
+                        self.frame_queue.get_nowait()
+                    self.frame_queue.put_nowait(ctk_image)
+                except queue.Full:
+                    pass
+
+    def update_ui_frame(self):
+        if not self.is_running:
+            return
+
+        try:
+            # Pull the latest ready image from the background thread
+            ctk_image = self.frame_queue.get_nowait()
             self.video_label.configure(image=ctk_image)
+            # Important: Keep a reference to prevent garbage collection flickering
+            self.video_label.image = ctk_image
+        except queue.Empty:
+            pass
 
-        # Schedule next loop iteration (~33ms = ~30 display FPS)
-        self.after(33, self.update_frame)
+        # Schedule next UI update very fast (15ms), as it no longer blocks AI
+        self.after(15, self.update_ui_frame)
 
     def on_closing(self):
         self.stop_camera()
