@@ -84,20 +84,35 @@ def voice_worker():
 def speak_navigation(action):
     global last_action, last_speech_time
     now = time.monotonic()
+    
     with voice_lock:
-        if action == last_action and now - last_speech_time < VOICE_COOLDOWN:
+        # 1. If it's the exact same action, respect the 4-second cooldown
+        if action == last_action and (now - last_speech_time) < VOICE_COOLDOWN:
             return
+            
+        last_prio = PRIORITY.get(last_action, 0)
+        new_prio = PRIORITY.get(action, 0)
+        
+        # 2. BUG FIX: If danger decreases (e.g., STOP -> CONTINUE), enforce cooldown.
+        # This prevents the system from spamming "Continue" if a bounding box drops for 1 frame.
+        # However, if danger INCREASES (CONTINUE -> STOP), it speaks immediately.
+        if new_prio < last_prio and (now - last_speech_time) < VOICE_COOLDOWN:
+            return
+
         phrase = PHRASES.get(action)
         if phrase is None:
             return
+            
         last_action = action
         last_speech_time = now
+
     try:
         while True:
             speech_queue.get_nowait()
             speech_queue.task_done()
     except queue.Empty:
         pass
+        
     try:
         speech_queue.put_nowait(phrase)
     except queue.Full:
@@ -151,46 +166,41 @@ def get_object_depth(depth_map, x1, y1, x2, y2):
     if valid.size == 0:
         return None
 
-    # CRITICAL FIX: Get the 10th percentile (the closest parts of the object) instead of the median
+    # Get the 10th percentile (the closest parts of the object) instead of the median
     return float(np.percentile(valid, 10))
 
-
-
 def navigation_decision(name, distance, position):
+    # Immediate STOP if anything is dangerously close directly in front
+    if distance < 1.0 and position == "CENTER":
+        return "STOP"
+
     if name in {"room door", "window"}:
-        return "CAUTION" if distance < 1.5 else "CONTINUE"
+        if distance < 1.0: return "STOP"
+        if distance < 2.0: return "CAUTION"
+        return "CONTINUE"
 
     if name == "stairs":
-        if distance < 1.5:
-            return "STOP"
-        elif distance < 2.5:
-            return "CAUTION"
+        if distance < 1.5: return "STOP"
+        if distance < 2.5: return "CAUTION"
         return "CONTINUE"
 
     if name not in OBSTACLES:
         return "CONTINUE"
 
-    # Increased STOP threshold from 0.8m to 1.3m (~4.2 feet)
     if distance < 1.3:
-        if position == "CENTER":
-            return "STOP"
-        elif position == "LEFT":
-            return "MOVE RIGHT"
+        if position == "CENTER": return "STOP"
+        elif position == "LEFT": return "MOVE RIGHT"
         return "MOVE LEFT"
 
-    # Increased CAUTION threshold from 1.5m to 2.2m (~7.2 feet)
     if distance < 2.2:
-        if position == "CENTER":
-            return "CAUTION"
-        elif position == "LEFT":
-            return "KEEP RIGHT"
+        if position == "CENTER": return "CAUTION"
+        elif position == "LEFT": return "KEEP RIGHT"
         return "KEEP LEFT"
 
     if distance < 3.5 and position == "CENTER":
         return "CAUTION"
 
     return "CONTINUE"
-
 
 # ---------------- DEPTH CONVERSION ----------------
 
@@ -244,7 +254,6 @@ def main():
     previous_time = time.monotonic()
     frame_count = 0
     
-    # Variables to "remember" data across skipped frames
     detections_to_draw = []
     current_action = "CONTINUE"
     current_warning = ""
@@ -261,7 +270,6 @@ def main():
                 frame_count += 1
                 frame_h, frame_w = frame.shape[:2]
 
-                # --- ONLY RUN AI MODELS EVERY 3rd FRAME ---
                 if frame_count % PROCESS_EVERY_N_FRAMES == 0:
                     results = detector.predict(source=frame, conf=CONFIDENCE, device=device, verbose=False)
                     result = results[0]
@@ -272,7 +280,6 @@ def main():
                     depth_map = get_depth_array(depth_result)
                     depth_map = cv2.resize(depth_map, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR)
 
-                    # Reset tracking variables for this new processing cycle
                     current_action = "CONTINUE"
                     current_warning = ""
                     detections_to_draw = []
@@ -296,12 +303,22 @@ def main():
                             level = distance_level(distance)
                             action = navigation_decision(class_name, distance, position)
 
-                            if PRIORITY[action] > PRIORITY[current_action]:
+                            if PRIORITY.get(action, 0) > PRIORITY.get(current_action, 0):
                                 current_action = action
                                 current_warning = f"{action}: {class_name} {distance:.2f}m {position}"
 
-                            # Save this detection to draw on current AND skipped frames
                             detections_to_draw.append((x1, y1, x2, y2, class_name, confidence, distance, level, action, position))
+
+                    # BUG FIX: Pure-Depth Safety Net for unclassified walls/close objects
+                    # This bypasses YOLO entirely. If anything physical is <1.0m away in the center, it forces a STOP.
+                    center_crop = depth_map[int(frame_h*0.3):int(frame_h*0.7), int(frame_w*0.3):int(frame_w*0.7)]
+                    valid_center = center_crop[np.isfinite(center_crop) & (center_crop > 0)]
+                    if valid_center.size > 0:
+                        center_dist = float(np.percentile(valid_center, 5))
+                        if center_dist < 1.0:
+                            if PRIORITY["STOP"] > PRIORITY.get(current_action, 0):
+                                current_action = "STOP"
+                                current_warning = f"STOP: Proximity Alert {center_dist:.2f}m CENTER"
 
                     visual = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
                     visual = cv2.applyColorMap(visual, cv2.COLORMAP_INFERNO)
@@ -311,7 +328,6 @@ def main():
                         torch.cuda.empty_cache()
                         gc.collect()
 
-                # --- DRAW ON EVERY FRAME (PROCESSED OR SKIPPED) ---
                 for det in detections_to_draw:
                     x1, y1, x2, y2, class_name, confidence, distance, level, action, position = det
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -319,7 +335,6 @@ def main():
                     cv2.putText(frame, f"Depth: {distance:.2f}", (x1, max(y1 - 20, 40)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
                     cv2.putText(frame, f"{level} | {position} | {action}", (x1, min(y2 + 20, frame_h - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 2)
 
-                # UI Colors
                 if current_action == "STOP":
                     color = (0, 0, 255)
                 elif current_action in {"MOVE LEFT", "MOVE RIGHT", "KEEP LEFT", "KEEP RIGHT"}:
@@ -358,7 +373,6 @@ def main():
         except queue.Full:
             pass
         print("Program stopped.")
-
 
 if __name__ == "__main__":
     main()
