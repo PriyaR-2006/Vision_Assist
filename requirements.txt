@@ -8,3 +8,4 @@ accelerate>=0.30
 safetensors>=0.4
 pyttsx3>=2.90
 customtkinter>=5.2
+
