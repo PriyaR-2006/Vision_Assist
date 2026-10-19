@@ -6,6 +6,7 @@ import threading
 import queue
 import pyttsx3
 import gc
+from pathlib import Path
 import customtkinter as ctk
 from PIL import Image
 from ultralytics import YOLOWorld
@@ -20,7 +21,7 @@ CONFIDENCE = 0.15
 VOICE_COOLDOWN = 4.0
 PROCESS_EVERY_N_FRAMES = 3
 
-YOLO_MODEL = "yolov8s-worldv2.pt"
+YOLO_MODEL = Path(__file__).resolve().parent / "yolov8s-worldv2.pt"
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
 
 CLASSES = [
@@ -57,6 +58,7 @@ PRIORITY = {
 speech_queue = queue.Queue(maxsize=1)
 last_action = None
 last_speech_time = 0.0
+voice_shutdown = False
 voice_lock = threading.Lock()
 
 def voice_worker():
@@ -68,7 +70,7 @@ def voice_worker():
         while True:
             phrase = speech_queue.get()
             try:
-                if phrase is None:
+                if phrase == "__STOP_VOICE_WORKER__":
                     return
                 engine.say(phrase)
                 engine.runAndWait()
@@ -87,6 +89,8 @@ def speak_navigation(action):
     now = time.monotonic()
     
     with voice_lock:
+        if voice_shutdown:
+            return
         if action == last_action and (now - last_speech_time) < VOICE_COOLDOWN:
             return
             
@@ -99,21 +103,27 @@ def speak_navigation(action):
         phrase = PHRASES.get(action)
         if phrase is None:
             return
-            
         last_action = action
         last_speech_time = now
-
-    try:
-        while True:
-            speech_queue.get_nowait()
-            speech_queue.task_done()
-    except queue.Empty:
-        pass
-        
-    try:
+        try:
+            while True:
+                speech_queue.get_nowait()
+                speech_queue.task_done()
+        except queue.Empty:
+            pass
         speech_queue.put_nowait(phrase)
-    except queue.Full:
-        pass
+
+def stop_voice_worker():
+    global voice_shutdown
+    with voice_lock:
+        voice_shutdown = True
+        try:
+            while True:
+                speech_queue.get_nowait()
+                speech_queue.task_done()
+        except queue.Empty:
+            pass
+        speech_queue.put_nowait("__STOP_VOICE_WORKER__")
 
 # ---------------- NAVIGATION HELPERS ----------------
 
@@ -214,74 +224,175 @@ class VisionAssistApp(ctk.CTk):
 
         self.cap = None
         self.is_running = False
+        self.models_ready = False
+        self._camera_thread = None
+        self._camera_stop_event = None
+        self._model_thread = None
+        self._closing = False
         self.device = 0 if torch.cuda.is_available() else -1
         
         # Thread-safe queue for sending processed frames to the UI
         self.frame_queue = queue.Queue(maxsize=2)
+        self.ui_event_queue = queue.Queue()
 
         # Start TTS Worker
-        threading.Thread(target=voice_worker, daemon=True).start()
+        self._voice_thread = threading.Thread(target=voice_worker, daemon=True)
+        self._voice_thread.start()
         
         # Load Models in Background
-        threading.Thread(target=self.load_models, daemon=True).start()
+        self._model_thread = threading.Thread(target=self.load_models, daemon=True)
+        self._model_thread.start()
+        self.after(50, self._process_ui_events)
 
     def load_models(self):
-        self.detector = YOLOWorld(YOLO_MODEL)
-        self.detector.set_classes(CLASSES)
-        self.depth_estimator = pipeline("depth-estimation", model=DEPTH_MODEL, device=self.device)
-        
+        try:
+            self.detector = YOLOWorld(str(YOLO_MODEL))
+            self.detector.set_classes(CLASSES)
+            
+            # OPTIMIZATION 1: Use FP16 (16-bit math) on GPU to double speed and halve VRAM
+            dtype = torch.float16 if self.device == 0 else torch.float32
+            self.depth_estimator = pipeline(
+                "depth-estimation", 
+                model=DEPTH_MODEL, 
+                device=self.device,
+                torch_dtype=dtype
+            )
+        except Exception as exc:
+            print(f"Model loading error: {exc}")
+            self.ui_event_queue.put(("model_load_error", str(exc)))
+            return
+
+        self.ui_event_queue.put(("models_loaded", None))
+
+    def _models_loaded(self):
+        self.models_ready = True
         self.video_label.configure(text="Models Loaded Successfully.\nReady to start.")
         self.start_btn.configure(state="normal")
 
+    def _show_model_load_error(self, error):
+        self.video_label.configure(text=f"Could not load AI models:\n{error}")
+        self.start_btn.configure(state="disabled")
+
+    def _process_ui_events(self):
+        if self._closing:
+            return
+        try:
+            while True:
+                event, payload = self.ui_event_queue.get_nowait()
+                if event == "models_loaded":
+                    self._models_loaded()
+                elif event == "model_load_error":
+                    self._show_model_load_error(payload)
+                elif event == "camera_error":
+                    stop_event, error = payload
+                    if self._camera_stop_event is stop_event and self.is_running:
+                        self.stop_camera()
+                        self.video_label.configure(text=f"Camera error:\n{error}")
+                elif event == "camera_finished":
+                    stop_event = payload
+                    if self._camera_stop_event is stop_event and self.is_running:
+                        self.stop_camera()
+                        self.video_label.configure(text="Camera stopped unexpectedly.")
+        except queue.Empty:
+            pass
+        self.after(50, self._process_ui_events)
+
     def start_camera(self):
-        if not self.is_running:
-            self.cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-            
-            self.is_running = True
-            self.start_btn.configure(state="disabled")
-            self.stop_btn.configure(state="normal")
-            self.video_label.configure(text="")
-            
-            # Start the heavy processing in a background thread
-            threading.Thread(target=self.ai_inference_loop, daemon=True).start()
-            
-            # Start the lightweight UI updater
-            self.update_ui_frame()
+        if self._closing or not self.models_ready or self.is_running:
+            return
+        if self._camera_thread is not None and self._camera_thread.is_alive():
+            return
+        while True:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            cap.release()
+            self.video_label.configure(text="Could not open camera. Check camera connection and permissions.")
+            return
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+        self.cap = cap
+        self._camera_stop_event = threading.Event()
+        self.is_running = True
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.video_label.configure(text="")
+
+        self._camera_thread = threading.Thread(
+            target=self.ai_inference_loop,
+            args=(cap, self._camera_stop_event),
+            daemon=True,
+        )
+        self._camera_thread.start()
+        self.update_ui_frame()
 
     def stop_camera(self):
         self.is_running = False
+        if self._camera_stop_event is not None:
+            self._camera_stop_event.set()
         if self.cap:
             self.cap.release()
+            self.cap = None
         self.video_label.configure(image="")
         self.video_label.configure(text="Camera Stopped.")
-        self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        if not self._closing:
+            self._enable_start_when_camera_stops()
         
         try:
             speech_queue.put_nowait("System stopped.")
         except queue.Full:
             pass
 
-    def ai_inference_loop(self):
+    def _enable_start_when_camera_stops(self):
+        if self._camera_thread is not None and self._camera_thread.is_alive():
+            self.after(50, self._enable_start_when_camera_stops)
+            return
+        self._camera_thread = None
+        self._camera_stop_event = None
+        if self.models_ready and not self._closing:
+            self.start_btn.configure(state="normal")
+
+    def ai_inference_loop(self, cap, stop_event):
+        try:
+            self._run_ai_inference_loop(cap, stop_event)
+        except Exception as exc:
+            print(f"Camera processing error: {exc}")
+            self.ui_event_queue.put(("camera_error", (stop_event, str(exc))))
+        finally:
+            self.ui_event_queue.put(("camera_finished", stop_event))
+
+    def _run_ai_inference_loop(self, cap, stop_event):
         frame_count = 0
         detections_to_draw = []
         current_action = "CONTINUE"
         current_warning = ""
         
         with torch.inference_mode():
-            while self.is_running and self.cap.isOpened():
-                success, frame = self.cap.read()
+            while not stop_event.is_set() and cap.isOpened():
+                success, frame = cap.read()
                 if not success:
-                    continue
+                    break
 
                 frame_count += 1
                 frame_h, frame_w = frame.shape[:2]
 
                 # Heavy AI processing
                 if frame_count % PROCESS_EVERY_N_FRAMES == 0:
-                    results = self.detector.predict(source=frame, conf=CONFIDENCE, device=self.device, verbose=False)
+                    results = self.detector.predict(
+                        source=frame, 
+                        conf=CONFIDENCE, 
+                        device=self.device, 
+                        half=True if self.device == 0 else False,
+                        imgsz=320, 
+                        verbose=False
+                    )
                     result = results[0]
 
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -349,23 +460,26 @@ class VisionAssistApp(ctk.CTk):
                 # Convert to UI format and send to the UI thread
                 cv2_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_image = Image.fromarray(cv2_image)
-                ctk_image = ctk.CTkImage(light_image=pil_image, size=(FRAME_WIDTH, FRAME_HEIGHT))
-                
                 try:
-                    # Overwrite old frame if UI is slightly behind
-                    if self.frame_queue.full():
-                        self.frame_queue.get_nowait()
-                    self.frame_queue.put_nowait(ctk_image)
+                    self.frame_queue.put_nowait(pil_image)
                 except queue.Full:
-                    pass
+                    try:
+                        self.frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self.frame_queue.put_nowait(pil_image)
+                    except queue.Full:
+                        pass
 
     def update_ui_frame(self):
-        if not self.is_running:
+        if not self.is_running or self._closing:
             return
 
         try:
             # Pull the latest ready image from the background thread
-            ctk_image = self.frame_queue.get_nowait()
+            pil_image = self.frame_queue.get_nowait()
+            ctk_image = ctk.CTkImage(light_image=pil_image, size=(FRAME_WIDTH, FRAME_HEIGHT))
             self.video_label.configure(image=ctk_image)
             # Important: Keep a reference to prevent garbage collection flickering
             self.video_label.image = ctk_image
@@ -376,7 +490,13 @@ class VisionAssistApp(ctk.CTk):
         self.after(15, self.update_ui_frame)
 
     def on_closing(self):
+        if self._closing:
+            return
+        self._closing = True
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="disabled")
         self.stop_camera()
+        stop_voice_worker()
         self.destroy()
 
 if __name__ == "__main__":
