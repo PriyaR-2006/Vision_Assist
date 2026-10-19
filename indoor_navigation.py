@@ -1,4 +1,3 @@
-
 import cv2
 import torch
 import numpy as np
@@ -6,6 +5,7 @@ import time
 import threading
 import queue
 import pyttsx3
+import gc
 from PIL import Image
 from ultralytics import YOLOWorld
 from transformers import pipeline
@@ -17,6 +17,7 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 CONFIDENCE = 0.25
 VOICE_COOLDOWN = 4.0
+PROCESS_EVERY_N_FRAMES = 3  # Only run models every 3rd frame to save GPU/Heat
 
 YOLO_MODEL = "yolov8s-worldv2.pt"
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
@@ -57,71 +58,50 @@ last_action = None
 last_speech_time = 0.0
 voice_lock = threading.Lock()
 
-
 def voice_worker():
     engine = None
-
     try:
         engine = pyttsx3.init()
         engine.setProperty("rate", 160)
         engine.setProperty("volume", 1.0)
-
         while True:
             phrase = speech_queue.get()
-
             try:
                 if phrase is None:
                     return
-
                 engine.say(phrase)
                 engine.runAndWait()
-
             except Exception as exc:
                 print("Voice error:", exc)
-
             finally:
                 speech_queue.task_done()
-
     except Exception as exc:
         print("Voice initialization error:", exc)
-
     finally:
         if engine is not None:
             engine.stop()
 
-
 def speak_navigation(action):
     global last_action, last_speech_time
-
     now = time.monotonic()
-
     with voice_lock:
-        if (
-            action == last_action
-            and now - last_speech_time < VOICE_COOLDOWN
-        ):
+        if action == last_action and now - last_speech_time < VOICE_COOLDOWN:
             return
-
         phrase = PHRASES.get(action)
-
         if phrase is None:
             return
-
         last_action = action
         last_speech_time = now
-
     try:
         while True:
             speech_queue.get_nowait()
             speech_queue.task_done()
     except queue.Empty:
         pass
-
     try:
         speech_queue.put_nowait(phrase)
     except queue.Full:
         pass
-
 
 # ---------------- NAVIGATION HELPERS ----------------
 
@@ -132,7 +112,6 @@ def get_position(center_x, width):
         return "CENTER"
     return "RIGHT"
 
-
 def distance_level(distance):
     if distance < 0.8:
         return "VERY NEAR"
@@ -141,7 +120,6 @@ def distance_level(distance):
     elif distance < 3.0:
         return "MEDIUM"
     return "FAR"
-
 
 def get_object_depth(depth_map, x1, y1, x2, y2):
     height, width = depth_map.shape[:2]
@@ -157,7 +135,6 @@ def get_object_depth(depth_map, x1, y1, x2, y2):
     box_w = x2 - x1
     box_h = y2 - y1
 
-    # Use the central 60% of the detected object.
     cx1 = int(x1 + 0.20 * box_w)
     cx2 = int(x2 - 0.20 * box_w)
     cy1 = int(y1 + 0.20 * box_h)
@@ -175,69 +152,51 @@ def get_object_depth(depth_map, x1, y1, x2, y2):
 
     return float(np.median(valid))
 
-
 def navigation_decision(name, distance, position):
     if name in {"room door", "window"}:
         return "CAUTION" if distance < 1.0 else "CONTINUE"
-
     if name == "stairs":
         if distance < 1.0:
             return "STOP"
         elif distance < 2.0:
             return "CAUTION"
         return "CONTINUE"
-
     if name not in OBSTACLES:
         return "CONTINUE"
-
     if distance < 0.8:
         if position == "CENTER":
             return "STOP"
         elif position == "LEFT":
             return "MOVE RIGHT"
         return "MOVE LEFT"
-
     if distance < 1.5:
         if position == "CENTER":
             return "CAUTION"
         elif position == "LEFT":
             return "KEEP RIGHT"
         return "KEEP LEFT"
-
     if distance < 3.0 and position == "CENTER":
         return "CAUTION"
-
     return "CONTINUE"
-
 
 # ---------------- DEPTH CONVERSION ----------------
 
 def get_depth_array(result):
     predicted = result.get("predicted_depth")
-
     if predicted is None:
-        raise RuntimeError(
-            "Depth model did not return predicted_depth."
-        )
-
+        raise RuntimeError("Depth model did not return predicted_depth.")
     if isinstance(predicted, torch.Tensor):
         depth = predicted.detach().float().squeeze().cpu().numpy()
     else:
         depth = np.asarray(predicted, dtype=np.float32).squeeze()
-
     if depth.ndim != 2:
-        raise RuntimeError(
-            f"Invalid depth map shape: {depth.shape}"
-        )
-
+        raise RuntimeError(f"Invalid depth map shape: {depth.shape}")
     return depth
-
 
 # ---------------- MAIN APPLICATION ----------------
 
 def main():
     device = 0 if torch.cuda.is_available() else -1
-
     print("PyTorch:", torch.__version__)
     print("CUDA available:", torch.cuda.is_available())
 
@@ -260,204 +219,131 @@ def main():
     print("Models loaded.")
 
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_V4L2)
-
     if not cap.isOpened():
         cap.release()
-        raise RuntimeError(
-            "Cannot open webcam. Check camera permissions "
-            "or try CAMERA_INDEX = 1."
-        )
+        raise RuntimeError("Cannot open webcam. Check camera permissions or try CAMERA_INDEX = 1.")
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-    threading.Thread(
-        target=voice_worker,
-        daemon=True
-    ).start()
+    threading.Thread(target=voice_worker, daemon=True).start()
 
     previous_time = time.monotonic()
+    frame_count = 0
+    
+    # Variables to "remember" data across skipped frames
+    detections_to_draw = []
+    current_action = "CONTINUE"
+    current_warning = ""
+    visual = None
 
     try:
-        while True:
-            success, frame = cap.read()
+        with torch.inference_mode(): 
+            while True:
+                success, frame = cap.read()
+                if not success:
+                    print("Cannot read webcam frame.")
+                    break
 
-            if not success:
-                print("Cannot read webcam frame.")
-                break
+                frame_count += 1
+                frame_h, frame_w = frame.shape[:2]
 
-            frame_h, frame_w = frame.shape[:2]
+                # --- ONLY RUN AI MODELS EVERY 3rd FRAME ---
+                if frame_count % PROCESS_EVERY_N_FRAMES == 0:
+                    results = detector.predict(source=frame, conf=CONFIDENCE, device=device, verbose=False)
+                    result = results[0]
 
-            # Object detection
-            results = detector.predict(
-                source=frame,
-                conf=CONFIDENCE,
-                device=device,
-                verbose=False
-            )
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    rgb_small = cv2.resize(rgb, (320, 240))
+                    depth_result = depth_estimator(Image.fromarray(rgb_small))
+                    depth_map = get_depth_array(depth_result)
+                    depth_map = cv2.resize(depth_map, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR)
 
-            result = results[0]
+                    # Reset tracking variables for this new processing cycle
+                    current_action = "CONTINUE"
+                    current_warning = ""
+                    detections_to_draw = []
 
-            # Depth estimation
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            depth_result = depth_estimator(Image.fromarray(rgb))
+                    if result.boxes is not None:
+                        for box in result.boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].detach().cpu().numpy().astype(int)
+                            confidence = float(box.conf[0].detach().cpu())
+                            class_id = int(box.cls[0].detach().cpu())
+                            
+                            names = result.names
+                            class_name = names.get(class_id, str(class_id)) if isinstance(names, dict) else names[class_id]
 
-            depth_map = get_depth_array(depth_result)
+                            center_x = (x1 + x2) // 2
+                            position = get_position(center_x, frame_w)
+                            distance = get_object_depth(depth_map, x1, y1, x2, y2)
 
-            depth_map = cv2.resize(
-                depth_map,
-                (frame_w, frame_h),
-                interpolation=cv2.INTER_LINEAR
-            )
+                            if distance is None:
+                                continue
 
-            current_action = "CONTINUE"
-            current_warning = ""
+                            level = distance_level(distance)
+                            action = navigation_decision(class_name, distance, position)
 
-            if result.boxes is not None:
-                for box in result.boxes:
-                    x1, y1, x2, y2 = (
-                        box.xyxy[0]
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .astype(int)
-                    )
+                            if PRIORITY[action] > PRIORITY[current_action]:
+                                current_action = action
+                                current_warning = f"{action}: {class_name} {distance:.2f}m {position}"
 
-                    confidence = float(box.conf[0].detach().cpu())
-                    class_id = int(box.cls[0].detach().cpu())
+                            # Save this detection to draw on current AND skipped frames
+                            detections_to_draw.append((x1, y1, x2, y2, class_name, confidence, distance, level, action, position))
 
-                    names = result.names
+                    visual = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    visual = cv2.applyColorMap(visual, cv2.COLORMAP_INFERNO)
+                    visual = cv2.resize(visual, (400, 300))
 
-                    if isinstance(names, dict):
-                        class_name = names.get(class_id, str(class_id))
-                    else:
-                        class_name = names[class_id]
+                    if frame_count % 30 == 0:
+                        torch.cuda.empty_cache()
+                        gc.collect()
 
-                    center_x = (x1 + x2) // 2
-                    position = get_position(center_x, frame_w)
+                # --- DRAW ON EVERY FRAME (PROCESSED OR SKIPPED) ---
+                for det in detections_to_draw:
+                    x1, y1, x2, y2, class_name, confidence, distance, level, action, position = det
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"{class_name} {confidence:.2f}", (x1, max(y1 - 40, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Depth: {distance:.2f}", (x1, max(y1 - 20, 40)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                    cv2.putText(frame, f"{level} | {position} | {action}", (x1, min(y2 + 20, frame_h - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 2)
 
-                    distance = get_object_depth(
-                        depth_map, x1, y1, x2, y2
-                    )
+                # UI Colors
+                if current_action == "STOP":
+                    color = (0, 0, 255)
+                elif current_action in {"MOVE LEFT", "MOVE RIGHT", "KEEP LEFT", "KEEP RIGHT"}:
+                    color = (0, 165, 255)
+                elif current_action == "CAUTION":
+                    color = (0, 255, 255)
+                else:
+                    color = (0, 255, 0)
 
-                    if distance is None:
-                        continue
+                speak_navigation(current_action)
 
-                    level = distance_level(distance)
+                cv2.rectangle(frame, (0, 0), (frame_w, 65), (0, 0, 0), -1)
+                cv2.putText(frame, f"NAVIGATION: {current_action}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-                    action = navigation_decision(
-                        class_name, distance, position
-                    )
+                if current_warning:
+                    cv2.putText(frame, current_warning, (15, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-                    if PRIORITY[action] > PRIORITY[current_action]:
-                        current_action = action
-                        current_warning = (
-                            f"{action}: {class_name} "
-                            f"{distance:.2f} depth units {position}"
-                        )
+                now = time.monotonic()
+                fps = 1.0 / max(now - previous_time, 1e-6)
+                previous_time = now
 
-                    # Bounding box
-                    cv2.rectangle(
-                        frame, (x1, y1), (x2, y2),
-                        (0, 255, 0), 2
-                    )
+                cv2.putText(frame, f"FPS: {fps:.1f}", (15, frame_h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-                    cv2.putText(
-                        frame,
-                        f"{class_name} {confidence:.2f}",
-                        (x1, max(y1 - 40, 20)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (0, 255, 0), 2
-                    )
+                cv2.imshow("Indoor Navigation System", frame)
+                if visual is not None:
+                    cv2.imshow("Depth Map - Visualization Only", visual)
 
-                    cv2.putText(
-                        frame,
-                        f"Depth: {distance:.2f}",
-                        (x1, max(y1 - 20, 40)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (255, 255, 0), 2
-                    )
-
-                    cv2.putText(
-                        frame,
-                        f"{level} | {position} | {action}",
-                        (x1, min(y2 + 20, frame_h - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (0, 255, 255), 2
-                    )
-
-            if current_action == "STOP":
-                color = (0, 0, 255)
-            elif current_action in {
-                "MOVE LEFT", "MOVE RIGHT",
-                "KEEP LEFT", "KEEP RIGHT"
-            }:
-                color = (0, 165, 255)
-            elif current_action == "CAUTION":
-                color = (0, 255, 255)
-            else:
-                color = (0, 255, 0)
-
-            speak_navigation(current_action)
-
-            cv2.rectangle(
-                frame, (0, 0), (frame_w, 65),
-                (0, 0, 0), -1
-            )
-
-            cv2.putText(
-                frame,
-                f"NAVIGATION: {current_action}",
-                (15, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, color, 2
-            )
-
-            if current_warning:
-                cv2.putText(
-                    frame, current_warning,
-                    (15, 54),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.4, (255, 255, 255), 1
-                )
-
-            # Visualization only; colors are not calibrated distances.
-            visual = cv2.normalize(
-                depth_map, None, 0, 255, cv2.NORM_MINMAX
-            ).astype(np.uint8)
-
-            visual = cv2.applyColorMap(
-                visual, cv2.COLORMAP_INFERNO
-            )
-
-            visual = cv2.resize(visual, (400, 300))
-
-            now = time.monotonic()
-            fps = 1.0 / max(now - previous_time, 1e-6)
-            previous_time = now
-
-            cv2.putText(
-                frame, f"FPS: {fps:.1f}",
-                (15, frame_h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5, (255, 255, 255), 1
-            )
-
-            cv2.imshow("Indoor Navigation System", frame)
-            cv2.imshow("Depth Map - Visualization Only", visual)
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
 
     finally:
         cap.release()
         cv2.destroyAllWindows()
-
         try:
             speech_queue.put_nowait(None)
         except queue.Full:
             pass
-
         print("Program stopped.")
 
 
